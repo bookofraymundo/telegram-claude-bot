@@ -1,5 +1,6 @@
 import os
 import logging
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -17,7 +18,11 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # conversation_history maps chat_id -> list of messages
 conversation_history: dict[int, list[dict]] = {}
 
-SYSTEM_PROMPT = """You are a personal assistant for Ray Santacruz, owner of Santacruz Brothers LLC — a general contracting company based in Arizona (MST timezone).
+# Load business context from context.md
+_context_file = Path(__file__).parent / "context.md"
+_context = _context_file.read_text() if _context_file.exists() else ""
+
+SYSTEM_PROMPT = f"""You are a personal assistant for Ray Santacruz, owner of Santacruz Brothers LLC — a general contracting company based in Arizona (MST timezone).
 
 ## About Ray's Business
 - General contracting: construction, remodeling, painting, tile, landscaping, and related trades
@@ -91,7 +96,11 @@ SYSTEM_PROMPT = """You are a personal assistant for Ray Santacruz, owner of Sant
 - If Ray shares a customer message, default to drafting a reply unless he says otherwise
 - Help him prioritize tasks and stay on top of follow-ups
 
-Be concise and direct. Just the answer or the draft."""
+Be concise and direct. Just the answer or the draft.
+
+---
+
+{_context}"""
 
 MAX_HISTORY = 40  # keep last 40 messages per chat to stay within token limits
 
