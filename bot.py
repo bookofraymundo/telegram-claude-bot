@@ -1,9 +1,13 @@
 import os
+import io
+import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
+from estimate_generator import build_estimate_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,10 +175,126 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(reply)
 
 
+ESTIMATE_SYSTEM_PROMPT = """You are a pricing assistant for Santacruz Brothers LLC.
+Given a job description, return a JSON object with the estimate details using Ray's rate card.
+
+Rate card:
+- Exterior paint labor: Easy $2.60/sqft, Standard $3.10/sqft, Complex $3.50/sqft
+- Interior paint labor: Easy $3.90/sqft, Standard $4.25/sqft, Complex $4.75/sqft
+- SW SuperPaint: charge $55/gal, BM Aura Exterior: charge $95/gal, BM Aura Interior: charge $95/gal
+- Coverage: 125 sqft/gal
+- Pavers: $9.50/sqft
+- Block wall add-on: $1,500 flat
+- Baseboard install labor: $3.50/lin ft
+- Baseboard painting: $2.75/lin ft
+- Tile demo (tile): $2.65/sqft, Tile demo (carpet): $1.25/sqft
+- Tile install labor: $3.85-$9.00/sqft
+- Smooth texture: $7.50/sqft
+- Supplies: ~$300/job for paint jobs
+- Estimates valid 7 days
+
+Return ONLY valid JSON in this exact format (no markdown, no explanation):
+{
+  "estimate_no": "1071",
+  "client_name": "Client Name",
+  "client_address": "Address line 1\\nCity, State ZIP",
+  "line_items": [
+    {
+      "name": "Short product/service name",
+      "description": "Detailed description of work",
+      "qty": "100",
+      "rate": "$3.50",
+      "amount": "$350.00"
+    }
+  ],
+  "total": 350.00,
+  "notes": "Any assumptions or notes for Ray to review"
+}
+
+Use the next estimate number after 1070 unless Ray specifies one. Calculate amounts precisely."""
+
+
+async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    args = ' '.join(context.args) if context.args else ''
+    if not args:
+        await update.message.reply_text(
+            "Describe the job after /estimate\n\n"
+            "Example:\n/estimate Rene Brofft, 308 lin ft baseboard install and paint"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=ESTIMATE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": args}],
+        )
+        raw = response.content[0].text.strip()
+
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}\nRaw: {raw}")
+        await update.message.reply_text("Couldn't parse the estimate — try rephrasing the job description.")
+        return
+    except Exception as e:
+        logger.error(f"Estimate Claude error: {e}")
+        await update.message.reply_text("Error generating estimate. Try again.")
+        return
+
+    today = datetime.now()
+    valid = today + timedelta(days=7)
+    estimate_date = today.strftime('%m/%d/%Y')
+    valid_through = valid.strftime('%m/%d/%Y')
+
+    try:
+        pdf_bytes = build_estimate_pdf(
+            estimate_no=data.get('estimate_no', '1071'),
+            estimate_date=estimate_date,
+            valid_through=valid_through,
+            client_name=data.get('client_name', ''),
+            client_address=data.get('client_address', ''),
+            line_items=data.get('line_items', []),
+            total=float(data.get('total', 0)),
+        )
+    except Exception as e:
+        logger.error(f"PDF generation error: {e}")
+        await update.message.reply_text("Error building PDF. Try again.")
+        return
+
+    notes = data.get('notes', '')
+    caption = f"📄 Estimate #{data.get('estimate_no', '')} — {data.get('client_name', '')}\nTotal: ${float(data.get('total', 0)):,.2f}"
+    if notes:
+        caption += f"\n\n⚠️ {notes}"
+
+    filename = f"Estimate_{data.get('estimate_no', 'DRAFT')}_{data.get('client_name', '').replace(' ', '_')}.pdf"
+
+    await update.message.reply_document(
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
+        caption=caption,
+    )
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("estimate", estimate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
