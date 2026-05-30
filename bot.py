@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 from estimate_generator import build_estimate_pdf
-from drive_uploader import upload_pdf as drive_upload
+from drive_uploader import upload_pdf as drive_upload, search_files, download_file
 
 DRIVE_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
@@ -413,12 +413,58 @@ async def invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+
+    query = ' '.join(context.args) if context.args else ''
+    if not query:
+        await update.message.reply_text(
+            "Search your Drive files with /find\n\nExample:\n/find Rene Brofft\n/find Walker invoice\n/find Nate estimate"
+        )
+        return
+
+    if not DRIVE_ENABLED:
+        await update.message.reply_text("Google Drive not connected.")
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+
+    try:
+        files = search_files(query)
+    except Exception as e:
+        logger.error(f"Drive search error: {e}")
+        await update.message.reply_text("Error searching Drive. Try again.")
+        return
+
+    if not files:
+        await update.message.reply_text(f"No files found for '{query}'.")
+        return
+
+    await update.message.reply_text(f"Found {len(files)} file(s) — sending...")
+
+    for f in files:
+        try:
+            pdf_bytes = download_file(f['id'])
+            await update.message.reply_document(
+                document=io.BytesIO(pdf_bytes),
+                filename=f['name'],
+                caption=f"📄 {f['name']}",
+            )
+        except Exception as e:
+            logger.error(f"Drive download error: {e}")
+            link = f.get('webViewLink', '')
+            await update.message.reply_text(f"📄 {f['name']}\n{link}")
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("estimate", estimate))
     app.add_handler(CommandHandler("invoice", invoice))
+    app.add_handler(CommandHandler("find", find))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
