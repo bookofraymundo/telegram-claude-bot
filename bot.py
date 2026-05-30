@@ -8,6 +8,9 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 from estimate_generator import build_estimate_pdf
+from drive_uploader import upload_pdf as drive_upload
+
+DRIVE_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -277,16 +280,136 @@ async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     notes = data.get('notes', '')
+    filename = f"Estimate_{data.get('estimate_no', 'DRAFT')}_{data.get('client_name', '').replace(' ', '_')}.pdf"
     caption = f"📄 Estimate #{data.get('estimate_no', '')} — {data.get('client_name', '')}\nTotal: ${float(data.get('total', 0)):,.2f}"
     if notes:
         caption += f"\n\n⚠️ {notes}"
 
-    filename = f"Estimate_{data.get('estimate_no', 'DRAFT')}_{data.get('client_name', '').replace(' ', '_')}.pdf"
+    # Upload to Google Drive
+    if DRIVE_ENABLED:
+        try:
+            drive_url = drive_upload(pdf_bytes, filename, 'Estimates')
+            caption += f"\n\n📁 [Saved to Drive]({drive_url})"
+        except Exception as e:
+            logger.error(f"Drive upload error: {e}")
 
     await update.message.reply_document(
         document=io.BytesIO(pdf_bytes),
         filename=filename,
         caption=caption,
+        parse_mode='Markdown',
+    )
+
+
+INVOICE_SYSTEM_PROMPT = """You are a billing assistant for Santacruz Brothers LLC.
+Given a job description, return a JSON object for a final invoice using Ray's rate card.
+
+Rate card:
+- Exterior paint labor: Easy $2.60/sqft, Standard $3.10/sqft, Complex $3.50/sqft
+- Interior paint labor: Easy $3.90/sqft, Standard $4.25/sqft, Complex $4.75/sqft
+- SW SuperPaint: charge $55/gal, BM Aura: charge $95/gal. Coverage: 125 sqft/gal
+- Pavers: $9.50/sqft, Block wall add-on: $1,500 flat
+- Baseboard install: $3.50/lin ft, Baseboard painting: $2.75/lin ft
+- Tile demo (tile): $2.65/sqft, Tile demo (carpet): $1.25/sqft
+- Tile install labor: $3.85-$9.00/sqft, Smooth texture: $7.50/sqft
+- Supplies: ~$300/job for paint jobs
+
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "invoice_no": "1071",
+  "client_name": "Client Name",
+  "client_address": "Address line 1\\nCity, State ZIP",
+  "line_items": [
+    {
+      "name": "Short product/service name",
+      "description": "Detailed description of work completed",
+      "qty": "100",
+      "rate": "$3.50",
+      "amount": "$350.00"
+    }
+  ],
+  "total": 350.00,
+  "notes": "Any assumptions or notes for Ray to review"
+}
+
+Use the next invoice number after 1070 unless Ray specifies one."""
+
+
+async def invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    args = ' '.join(context.args) if context.args else ''
+    if not args:
+        await update.message.reply_text(
+            "Describe the completed job after /invoice\n\n"
+            "Example:\n/invoice Rene Brofft, 308 lin ft baseboard install and paint, completed"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=INVOICE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": args}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}\nRaw: {raw}")
+        await update.message.reply_text("Couldn't parse the invoice — try rephrasing.")
+        return
+    except Exception as e:
+        logger.error(f"Invoice Claude error: {e}")
+        await update.message.reply_text("Error generating invoice. Try again.")
+        return
+
+    today = datetime.now()
+    invoice_date = today.strftime('%m/%d/%Y')
+
+    try:
+        pdf_bytes = build_estimate_pdf(
+            estimate_no=data.get('invoice_no', '1071'),
+            estimate_date=invoice_date,
+            valid_through='',
+            client_name=data.get('client_name', ''),
+            client_address=data.get('client_address', ''),
+            line_items=data.get('line_items', []),
+            total=float(data.get('total', 0)),
+        )
+    except Exception as e:
+        logger.error(f"Invoice PDF error: {e}")
+        await update.message.reply_text("Error building PDF. Try again.")
+        return
+
+    notes = data.get('notes', '')
+    filename = f"Invoice_{data.get('invoice_no', 'DRAFT')}_{data.get('client_name', '').replace(' ', '_')}.pdf"
+    caption = f"🧾 Invoice #{data.get('invoice_no', '')} — {data.get('client_name', '')}\nTotal: ${float(data.get('total', 0)):,.2f}"
+    if notes:
+        caption += f"\n\n⚠️ {notes}"
+
+    if DRIVE_ENABLED:
+        try:
+            drive_url = drive_upload(pdf_bytes, filename, 'Invoices')
+            caption += f"\n\n📁 [Saved to Drive]({drive_url})"
+        except Exception as e:
+            logger.error(f"Drive upload error: {e}")
+
+    await update.message.reply_document(
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
+        caption=caption,
+        parse_mode='Markdown',
     )
 
 
@@ -295,6 +418,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("estimate", estimate))
+    app.add_handler(CommandHandler("invoice", invoice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
