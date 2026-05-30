@@ -10,6 +10,9 @@ import anthropic
 from estimate_generator import build_estimate_pdf
 from drive_uploader import upload_pdf as drive_upload, search_files, download_file
 from calendar_generator import build_ics, cancel_ics, update_ics
+from calendar_api import add_event, delete_event, update_event, find_event
+
+CALENDAR_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
 DRIVE_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
@@ -499,49 +502,68 @@ async def cal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         action = data.get('action', 'add')
 
+        if CALENDAR_ENABLED:
+            # Use Google Calendar API directly — no tapping needed
+            if action == 'cancel':
+                orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
+                event_id = find_event(data['title'], data['original_date'])
+                if event_id:
+                    delete_event(event_id)
+                    await update.message.reply_text(f"🗑 Removed '{data['title']}' on {data['original_date']} from your calendar.")
+                else:
+                    await update.message.reply_text(f"Couldn't find '{data['title']}' on {data['original_date']}. Check the date and try again.")
+                return
+
+            elif action == 'update':
+                orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
+                new_start  = datetime.strptime(f"{data['new_date']} {data['new_start_time']}", "%Y-%m-%d %H:%M")
+                new_end    = datetime.strptime(f"{data['new_date']} {data['new_end_time']}", "%Y-%m-%d %H:%M")
+                event_id = find_event(data['title'], data['original_date'])
+                if event_id:
+                    update_event(event_id, data['title'], new_start, new_end, data.get('location', ''))
+                    await update.message.reply_text(
+                        f"✏️ Updated '{data['title']}'\n📆 Now: {data['new_date']} {data['new_start_time']}–{data['new_end_time']} MST"
+                    )
+                else:
+                    await update.message.reply_text(f"Couldn't find '{data['title']}' on {data['original_date']}. Check the date and try again.")
+                return
+
+            else:  # add
+                start = datetime.strptime(f"{data['date']} {data['start_time']}", "%Y-%m-%d %H:%M")
+                end   = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
+                add_event(data['title'], start, end, data.get('location', ''), data.get('description', ''))
+                reply = f"✅ Added to your calendar:\n📅 {data['title']}\n📆 {data['date']} {data['start_time']}–{data['end_time']} MST"
+                if data.get('location'):
+                    reply += f"\n📍 {data['location']}"
+                reply += "\n🔔 Reminders: 1 day + 1 hour before"
+                await update.message.reply_text(reply)
+                return
+
+        # Fallback: send .ics file
         if action == 'cancel':
             orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
             ics_bytes = cancel_ics(title=data['title'], original_start=orig_start)
             filename = f"CANCEL_{data['original_date']}_{data['title'].replace(' ', '_')[:30]}.ics"
             caption = f"🗑 Cancellation: {data['title']}\n📆 {data['original_date']} {data['original_start_time']} MST\n\nTap to remove from your calendar."
-
         elif action == 'update':
             orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
-            new_start = datetime.strptime(f"{data['new_date']} {data['new_start_time']}", "%Y-%m-%d %H:%M")
-            new_end = datetime.strptime(f"{data['new_date']} {data['new_end_time']}", "%Y-%m-%d %H:%M")
-            ics_bytes = update_ics(
-                title=data['title'],
-                original_start=orig_start,
-                new_start=new_start,
-                new_end=new_end,
-                location=data.get('location', ''),
-            )
+            new_start  = datetime.strptime(f"{data['new_date']} {data['new_start_time']}", "%Y-%m-%d %H:%M")
+            new_end    = datetime.strptime(f"{data['new_date']} {data['new_end_time']}", "%Y-%m-%d %H:%M")
+            ics_bytes = update_ics(data['title'], orig_start, new_start, new_end, data.get('location', ''))
             filename = f"UPDATE_{data['new_date']}_{data['title'].replace(' ', '_')[:30]}.ics"
-            caption = f"✏️ Updated: {data['title']}\n📆 Moved to {data['new_date']} {data['new_start_time']}–{data['new_end_time']} MST\n\nTap to update your calendar."
-
-        else:  # add
+            caption = f"✏️ Updated: {data['title']}\n📆 {data['new_date']} {data['new_start_time']}–{data['new_end_time']} MST\n\nTap to update your calendar."
+        else:
             start = datetime.strptime(f"{data['date']} {data['start_time']}", "%Y-%m-%d %H:%M")
-            end = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
-            ics_bytes = build_ics(
-                title=data['title'], start=start, end=end,
-                location=data.get('location', ''), description=data.get('description', ''),
-            )
+            end   = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
+            ics_bytes = build_ics(data['title'], start, end, data.get('location', ''), data.get('description', ''))
             filename = f"{data['date']}_{data['title'].replace(' ', '_')[:30]}.ics"
-            caption = f"📅 {data['title']}\n📆 {data['date']} {data['start_time']}–{data['end_time']} MST"
-            if data.get('location'):
-                caption += f"\n📍 {data['location']}"
-            caption += "\n\nTap the file to add to your calendar."
+            caption = f"📅 {data['title']}\n📆 {data['date']} {data['start_time']}–{data['end_time']} MST\n\nTap to add to your calendar."
+
+        await update.message.reply_document(document=io.BytesIO(ics_bytes), filename=filename, caption=caption)
 
     except Exception as e:
-        logger.error(f"ICS build error: {e}")
-        await update.message.reply_text("Error building calendar event. Try again.")
-        return
-
-    await update.message.reply_document(
-        document=io.BytesIO(ics_bytes),
-        filename=filename,
-        caption=caption,
-    )
+        logger.error(f"Calendar error: {e}", exc_info=True)
+        await update.message.reply_text(f"Calendar error: {str(e)[:200]}")
 
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
