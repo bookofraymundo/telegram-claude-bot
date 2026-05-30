@@ -434,8 +434,8 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         files = search_files(query)
     except Exception as e:
-        logger.error(f"Drive search error: {e}")
-        await update.message.reply_text("Error searching Drive. Try again.")
+        logger.error(f"Drive search error: {e}", exc_info=True)
+        await update.message.reply_text(f"Drive error: {str(e)[:300]}")
         return
 
     if not files:
