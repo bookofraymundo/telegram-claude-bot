@@ -9,6 +9,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 import anthropic
 from estimate_generator import build_estimate_pdf
 from drive_uploader import upload_pdf as drive_upload, search_files, download_file
+from calendar_generator import build_ics
 
 DRIVE_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
@@ -413,6 +414,96 @@ async def invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+CAL_SYSTEM_PROMPT = """You are a calendar assistant for Ray Santacruz in Phoenix, Arizona (MST = UTC-7, no daylight saving).
+Today's date is provided in the user message.
+
+Given an event description, return ONLY valid JSON (no markdown):
+{
+  "title": "Event title",
+  "date": "YYYY-MM-DD",
+  "start_time": "HH:MM",
+  "end_time": "HH:MM",
+  "location": "optional location or empty string",
+  "description": "optional notes or empty string"
+}
+
+Rules:
+- Default duration: 1 hour
+- If no time given, use 08:00
+- If "morning" → 08:00, "afternoon" → 13:00, "evening" → 17:00
+- Relative dates like "Friday", "next Monday" should be resolved using today's date
+- 24-hour format for times"""
+
+
+async def cal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+
+    args = ' '.join(context.args) if context.args else ''
+    if not args:
+        await update.message.reply_text(
+            "Add a calendar event with /cal\n\n"
+            "Examples:\n"
+            "/cal Meeting with Rene Friday at 2pm\n"
+            "/cal Nate walkthrough Monday 9am at 123 Main St\n"
+            "/cal Don Foster job starts June 5"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=CAL_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Today is {today}. Event: {args}"}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw.strip())
+    except Exception as e:
+        logger.error(f"Cal parse error: {e}")
+        await update.message.reply_text("Couldn't parse that event. Try: /cal [event] [day] at [time]")
+        return
+
+    try:
+        start = datetime.strptime(f"{data['date']} {data['start_time']}", "%Y-%m-%d %H:%M")
+        end = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
+        ics_bytes = build_ics(
+            title=data['title'],
+            start=start,
+            end=end,
+            location=data.get('location', ''),
+            description=data.get('description', ''),
+        )
+    except Exception as e:
+        logger.error(f"ICS build error: {e}")
+        await update.message.reply_text("Error building calendar event. Try again.")
+        return
+
+    filename = f"{data['date']}_{data['title'].replace(' ', '_')[:30]}.ics"
+    caption = (
+        f"📅 {data['title']}\n"
+        f"📆 {data['date']} {data['start_time']}–{data['end_time']} MST"
+    )
+    if data.get('location'):
+        caption += f"\n📍 {data['location']}"
+    caption += "\n\nTap the file to add to your calendar."
+
+    await update.message.reply_document(
+        document=io.BytesIO(ics_bytes),
+        filename=filename,
+        caption=caption,
+    )
+
+
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -465,6 +556,7 @@ def main() -> None:
     app.add_handler(CommandHandler("estimate", estimate))
     app.add_handler(CommandHandler("invoice", invoice))
     app.add_handler(CommandHandler("find", find))
+    app.add_handler(CommandHandler("cal", cal))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
