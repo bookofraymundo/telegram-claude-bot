@@ -9,7 +9,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 import anthropic
 from estimate_generator import build_estimate_pdf
 from drive_uploader import upload_pdf as drive_upload, search_files, download_file
-from calendar_generator import build_ics
+from calendar_generator import build_ics, cancel_ics, update_ics
 
 DRIVE_ENABLED = all(os.environ.get(k) for k in ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
 
@@ -417,22 +417,45 @@ async def invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 CAL_SYSTEM_PROMPT = """You are a calendar assistant for Ray Santacruz in Phoenix, Arizona (MST = UTC-7, no daylight saving).
 Today's date is provided in the user message.
 
-Given an event description, return ONLY valid JSON (no markdown):
+Detect the intent and return ONLY valid JSON (no markdown):
+
+For NEW events:
 {
+  "action": "add",
   "title": "Event title",
   "date": "YYYY-MM-DD",
   "start_time": "HH:MM",
   "end_time": "HH:MM",
-  "location": "optional location or empty string",
-  "description": "optional notes or empty string"
+  "location": "optional or empty string",
+  "description": "optional or empty string"
+}
+
+For CANCEL events:
+{
+  "action": "cancel",
+  "title": "Event title",
+  "original_date": "YYYY-MM-DD",
+  "original_start_time": "HH:MM"
+}
+
+For UPDATE/MOVE events:
+{
+  "action": "update",
+  "title": "Event title",
+  "original_date": "YYYY-MM-DD",
+  "original_start_time": "HH:MM",
+  "new_date": "YYYY-MM-DD",
+  "new_start_time": "HH:MM",
+  "new_end_time": "HH:MM",
+  "location": "optional or empty string"
 }
 
 Rules:
 - Default duration: 1 hour
 - If no time given, use 08:00
-- If "morning" → 08:00, "afternoon" → 13:00, "evening" → 17:00
-- Relative dates like "Friday", "next Monday" should be resolved using today's date
-- 24-hour format for times"""
+- morning → 08:00, afternoon → 13:00, evening → 17:00
+- Resolve relative dates (Friday, next Monday) using today's date
+- 24-hour format for all times"""
 
 
 async def cal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -474,28 +497,45 @@ async def cal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        start = datetime.strptime(f"{data['date']} {data['start_time']}", "%Y-%m-%d %H:%M")
-        end = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
-        ics_bytes = build_ics(
-            title=data['title'],
-            start=start,
-            end=end,
-            location=data.get('location', ''),
-            description=data.get('description', ''),
-        )
+        action = data.get('action', 'add')
+
+        if action == 'cancel':
+            orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
+            ics_bytes = cancel_ics(title=data['title'], original_start=orig_start)
+            filename = f"CANCEL_{data['original_date']}_{data['title'].replace(' ', '_')[:30]}.ics"
+            caption = f"🗑 Cancellation: {data['title']}\n📆 {data['original_date']} {data['original_start_time']} MST\n\nTap to remove from your calendar."
+
+        elif action == 'update':
+            orig_start = datetime.strptime(f"{data['original_date']} {data['original_start_time']}", "%Y-%m-%d %H:%M")
+            new_start = datetime.strptime(f"{data['new_date']} {data['new_start_time']}", "%Y-%m-%d %H:%M")
+            new_end = datetime.strptime(f"{data['new_date']} {data['new_end_time']}", "%Y-%m-%d %H:%M")
+            ics_bytes = update_ics(
+                title=data['title'],
+                original_start=orig_start,
+                new_start=new_start,
+                new_end=new_end,
+                location=data.get('location', ''),
+            )
+            filename = f"UPDATE_{data['new_date']}_{data['title'].replace(' ', '_')[:30]}.ics"
+            caption = f"✏️ Updated: {data['title']}\n📆 Moved to {data['new_date']} {data['new_start_time']}–{data['new_end_time']} MST\n\nTap to update your calendar."
+
+        else:  # add
+            start = datetime.strptime(f"{data['date']} {data['start_time']}", "%Y-%m-%d %H:%M")
+            end = datetime.strptime(f"{data['date']} {data['end_time']}", "%Y-%m-%d %H:%M")
+            ics_bytes = build_ics(
+                title=data['title'], start=start, end=end,
+                location=data.get('location', ''), description=data.get('description', ''),
+            )
+            filename = f"{data['date']}_{data['title'].replace(' ', '_')[:30]}.ics"
+            caption = f"📅 {data['title']}\n📆 {data['date']} {data['start_time']}–{data['end_time']} MST"
+            if data.get('location'):
+                caption += f"\n📍 {data['location']}"
+            caption += "\n\nTap the file to add to your calendar."
+
     except Exception as e:
         logger.error(f"ICS build error: {e}")
         await update.message.reply_text("Error building calendar event. Try again.")
         return
-
-    filename = f"{data['date']}_{data['title'].replace(' ', '_')[:30]}.ics"
-    caption = (
-        f"📅 {data['title']}\n"
-        f"📆 {data['date']} {data['start_time']}–{data['end_time']} MST"
-    )
-    if data.get('location'):
-        caption += f"\n📍 {data['location']}"
-    caption += "\n\nTap the file to add to your calendar."
 
     await update.message.reply_document(
         document=io.BytesIO(ics_bytes),
